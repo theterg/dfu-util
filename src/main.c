@@ -179,6 +179,7 @@ static void help(void)
 		"  -l --list\t\t\tList currently attached DFU capable devices\n");
 	fprintf(stderr, "  -e --detach\t\t\tDetach currently attached DFU capable devices\n"
 		"  -E --detach-delay seconds\tTime to wait before reopening a device after detach\n"
+		"  -n --nodetach\t\t\tUse with -R to reset device that doesn't support DFU_DETACH\n"
 		"  -d --device <vendor>:<product>[,<vendor_dfu>:<product_dfu>]\n"
 		"\t\t\t\tSpecify Vendor/Product ID(s) of DFU device\n"
 		"  -p --path <bus-port. ... .port>\tSpecify path to DFU device\n"
@@ -216,6 +217,7 @@ static struct option opts[] = {
 	{ "list", 0, 0, 'l' },
 	{ "detach", 0, 0, 'e' },
 	{ "detach-delay", 1, 0, 'E' },
+	{ "nodetch", 0, 0, 'n' },
 	{ "device", 1, 0, 'd' },
 	{ "path", 1, 0, 'p' },
 	{ "configuration", 1, 0, 'c' },
@@ -244,6 +246,7 @@ int main(int argc, char **argv)
 	struct dfu_file file;
 	char *end;
 	int final_reset = 0;
+  int detach_unsupported = 0;
 	int ret;
 	int dfuse_device = 0;
 	int fd;
@@ -259,7 +262,7 @@ int main(int argc, char **argv)
 
 	while (1) {
 		int c, option_index = 0;
-		c = getopt_long(argc, argv, "hVvleE:d:p:c:i:a:S:t:U:D:Rs:Z:", opts,
+		c = getopt_long(argc, argv, "hVvlenE:d:p:c:i:a:S:t:U:D:Rs:Z:", opts,
 				&option_index);
 		if (c == -1)
 			break;
@@ -285,6 +288,9 @@ int main(int argc, char **argv)
 		case 'E':
 			detach_delay = atoi(optarg);
 			break;
+    case 'n':
+      detach_unsupported = 1;
+      break;
 		case 'd':
 			parse_vendprod(optarg);
 			break;
@@ -450,12 +456,14 @@ int main(int argc, char **argv)
 		switch (status.bState) {
 		case DFU_STATE_appIDLE:
 		case DFU_STATE_appDETACH:
-			printf("Device really in Runtime Mode, send DFU "
-			       "detach request...\n");
-			if (dfu_detach(dfu_root->dev_handle,
-				       dfu_root->interface, 1000) < 0) {
-				warnx("error detaching");
-			}
+      if (!detach_unsupported) {
+        printf("Device really in Runtime Mode, send DFU "
+               "detach request...\n");
+        if (dfu_detach(dfu_root->dev_handle,
+                 dfu_root->interface, 1000) < 0) {
+          warnx("error detaching");
+        }
+      }
 			if (dfu_root->func_dfu.bmAttributes & USB_DFU_WILL_DETACH) {
 				printf("Device will detach and reattach...\n");
 			} else {
@@ -669,7 +677,10 @@ status_again:
 	 	}
 		break;
 	case MODE_DETACH:
-		if (dfu_detach(dfu_root->dev_handle, dfu_root->interface, 1000) < 0) {
+    if (detach_unsupported)
+      break;
+    ret = dfu_detach(dfu_root->dev_handle, dfu_root->interface, 1000);
+		if (ret < 0) {
 			warnx("can't detach");
 		}
 		break;
@@ -679,11 +690,31 @@ status_again:
 	}
 
 	if (final_reset) {
-		if (dfu_detach(dfu_root->dev_handle, dfu_root->interface, 1000) < 0) {
-			/* Even if detach failed, just carry on to leave the
-                           device in a known state */
-			warnx("can't detach");
-		}
+    if (detach_unsupported) {
+      // STM32 DFU devices dont support DFU_DETACH
+      // Instead, force the device into STATE_DFU_MANIFEST_WAIT_RESET
+      // by sending a download request of size 0 and checking the state
+      if (dfu_download(dfu_root->dev_handle, dfu_root->interface, 0x0, 0x0, NULL)) {
+        warnx("Failure forcing a manifest");
+      } else {
+        if (dfu_get_status(dfu_root, &status) < 0) {
+          warnx("Unable to check status after manifest");
+        } else {
+          printf("state = %s, status = %d\n",
+                 dfu_state_to_string(status.bState), status.bStatus);
+          if (status.bState != STATE_DFU_MANIFEST) {
+            warnx("Device should be in manifest state");
+          }
+        }
+      }
+    } else {
+      if (dfu_detach(dfu_root->dev_handle, dfu_root->interface, 1000) < 0) {
+        /* Even if detach failed, just carry on to leave the
+                             device in a known state */
+      	warnx("can't detach");
+      }
+    }
+
 		printf("Resetting USB to switch back to runtime mode\n");
 		ret = libusb_reset_device(dfu_root->dev_handle);
 		if (ret < 0 && ret != LIBUSB_ERROR_NOT_FOUND) {
